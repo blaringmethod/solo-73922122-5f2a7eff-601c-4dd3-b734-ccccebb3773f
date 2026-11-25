@@ -23,12 +23,20 @@ pre_date_r 为切换前一交易日；任一所需报价缺失则 delta 为 NULL
 - 连续价不落地：单笔报价更新只写 prices 与至多一个 delta + Fenwick 单点，
   绝不逐日回写连续价。
 - 单次取数在一个只读快照事务内完成（同一已提交状态），逐日用对数级查询。
+- 查价区间缓存（range_cache，单槽，网页与 CSV 共用）：
+  命中时不读 prices 逐日原价，整次取数读取的换月及索引记录数至多 O(log n)
+  （2 次切换日索引定位、1 次部分索引 LIMIT 1、Fenwick 两个前缀和）；
+  缓存行随区间天数线性增长，但那是缓存自身数据、不是逐日原价重读。
+- 缓存失效只认 change_log 版本：区间内交易日的报价更正、日历/计划变更才作废；
+  仅联动区间末日之后换月的补改报价不失效，命中时尾部按最新价差现算。
 
 事务语义
 ========
-- 报价更新（新增/更正）在单个 IMMEDIABLE 事务内提交：原价与受影响价差一起生效，
-  不会出现“价已改、价差未改”的中间状态。
+- 报价更新（新增/更正）在单个 IMMEDIATE 事务内提交：原价、受影响价差、变更版本
+  一起生效，不会出现“价已改、价差未改”的中间状态。
 - 保存失败时事务整体回滚，调用方仍可拿到本次计算的预期结果用于页面展示。
+- 缓存发布在独立写事务内复核版本：构建期间若有新变更提交则放弃发布，
+  晚算完的旧缓存不会供新请求使用。
 """
 
 from __future__ import annotations
@@ -111,7 +119,7 @@ def snapshot(conn: sqlite3.Connection):
 
 @contextmanager
 def write_tx(conn: sqlite3.Connection):
-    """立即写事务：保证“原价 + 受影响价差”原子提交，失败整体回滚。"""
+    """立即写事务：保证“原价 + 受影响价差 + 变更版本”原子提交，失败整体回滚。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -119,6 +127,29 @@ def write_tx(conn: sqlite3.Connection):
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+# --------------------------------------------------------------------------- #
+# 变更版本日志：缓存一致性的唯一依据
+# --------------------------------------------------------------------------- #
+# 每条写事务在同一 IMMEDIATE 事务内追加一条 change_log（ver 自增），
+# 缓存发布时记下当时的 ver；命中前检查 (built_ver, 现在] 是否存在影响本区间的变更。
+# 这样“建缓存期间行情员补改报价”时，旧缓存要么带着更新的 ver 发布（含新数据），
+# 要么被随后提交的变更标记为过期——晚算完的旧缓存不可能供新请求使用。
+
+def current_ver(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(ver), 0) AS v FROM change_log").fetchone()
+    return row["v"]
+
+
+def _record_change(conn: sqlite3.Connection, scope: str, reason: str,
+                   change_day: Optional[str] = None) -> int:
+    """在当前写事务内登记一条变更并返回新版本号（须已在 write_tx 中）。"""
+    cur = conn.execute(
+        "INSERT INTO change_log(scope, change_day, reason) VALUES (?, ?, ?)",
+        (scope, change_day, reason),
+    )
+    return cur.lastrowid
 
 
 # --------------------------------------------------------------------------- #
@@ -138,6 +169,8 @@ def replace_calendar(conn: sqlite3.Connection, dates: list[str]) -> int:
     with write_tx(conn):
         conn.execute("DELETE FROM calendar")
         conn.executemany("INSERT INTO calendar(date) VALUES (?)", [(d,) for d in cleaned])
+        # 日历变更后取数口径可能整体变化，全部缓存作废
+        _record_change(conn, "config", "replace_calendar")
     return len(cleaned)
 
 
@@ -223,6 +256,8 @@ def setup_plan(conn: sqlite3.Connection, initial_code: str,
         conn.execute("DELETE FROM rolls")
         conn.execute("DELETE FROM contracts")
         conn.execute("DELETE FROM bit_sums")
+        conn.execute("DELETE FROM range_cache_rows")
+        conn.execute("DELETE FROM range_cache")
 
         cur = conn.execute(
             "INSERT INTO contracts(code, ord) VALUES (?, 0)", (initial_code,)
@@ -242,6 +277,8 @@ def setup_plan(conn: sqlite3.Connection, initial_code: str,
                 "VALUES (?, ?, ?, ?, NULL)",
                 (k, sd, pre, new_id),
             )
+        # 计划重建后合约/换月口径变化，登记 config 变更使任何残留缓存作废
+        _record_change(conn, "config", "setup_plan")
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +414,11 @@ def upsert_price(conn: sqlite3.Connection, contract_id: int, day: str,
             if affected_roll is not None:
                 new_delta = _recompute_roll_delta(conn, affected_roll["ord"])
                 preview["new_delta"] = new_delta
+            # 与原价/价差同一事务登记变更：只影响“覆盖该交易日”的查价缓存。
+            # 若该报价只联动区间末日之后的换月（pre_date > 区间末日），
+            # 不含该交易日的缓存仍可命中，由命中逻辑按最新价差出数。
+            new_ver = _record_change(conn, "range", "upsert_price", change_day=day)
+            preview["ver"] = new_ver
         # 事务已由上下文管理器提交：原价与受影响价差同时生效
         preview["committed"] = True
     except sqlite3.Error as e:
@@ -387,8 +429,28 @@ def upsert_price(conn: sqlite3.Connection, contract_id: int, day: str,
 
 
 # --------------------------------------------------------------------------- #
-# 取数：逐日连续价
+# 取数：逐日连续价 + 查价区间缓存（网页与 CSV 共用）
 # --------------------------------------------------------------------------- #
+#
+# 缓存模型
+# ========
+# 单槽缓存 range_cache(1)，键为 (start, end)：只缓存“区间末日 end 及之前”的逐日
+# 稳定部分——当日原价、在用合约、以及切换日落入 (d, end] 的稳定窗口价差和。
+# end 之后到本次基准日 base 的“尾部换月”不进缓存：命中时按当前库的最新 rolls/
+# bit_sums 现算（索引反向定位 + Fenwick，O(log n)），因此：
+#   - 来回换基准日（base ≥ end）直接命中，prices 表零读取；
+#   - 补改报价只联动 end 之后的换月（pre_date > end）时，缓存不失效，
+#     按本次基准日和最新价差出数；
+#   - 区间内交易日的报价更正、日历或计划变更会使缓存失效（change_log 判定）。
+#
+# 一致性
+# ======
+# 每次取数全程在同一个只读快照事务内：缓存命中判定、缓存行、尾部最新价差都来自
+# 同一已提交状态。缓存发布在独立写事务中复核版本号，构建期间若有新变更提交则放弃
+# 发布——晚算完的旧缓存不可能供新请求使用。
+
+CACHE_ID = 1
+
 
 def active_contract_ord(conn: sqlite3.Connection, day: str) -> int:
     """
@@ -406,7 +468,7 @@ def active_contract_ord(conn: sqlite3.Connection, day: str) -> int:
 
 def _first_missing_roll(conn: sqlite3.Connection, lo_ord: int,
                         hi_ord: int) -> Optional[sqlite3.Row]:
-    """区间 [lo_ord, hi_ord] 内最早一个缺价差的换月。"""
+    """区间 [lo_ord, hi_ord] 内最早一个缺价差的换月（部分索引 LIMIT 1）。"""
     if lo_ord > hi_ord:
         return None
     return conn.execute(
@@ -432,12 +494,195 @@ def _missing_quote_contracts(conn: sqlite3.Connection,
     return missing
 
 
-def fetch_range(conn: sqlite3.Connection, start: str, end: str,
-                base: str) -> list[dict]:
+def _missing_roll_message(conn: sqlite3.Connection, roll: sqlite3.Row) -> str:
+    """缺价差换月的统一提示文案（构建缓存与命中现算共用，沿用原提示规则）。"""
+    miss_cs = _missing_quote_contracts(conn, roll)
+    names = "、".join(
+        f"{c['code']}({roll['pre_date']})" for c in miss_cs
+    ) or "价差所需报价"
+    return (
+        f"换月 {roll['old_code']} → {roll['new_code']} "
+        f"（切换日 {roll['switch_date']}）缺价差，待补报价：{names}"
+    )
+
+
+def _invalidation_ver(conn: sqlite3.Connection, since_ver: int,
+                      start: str, end: str) -> Optional[int]:
+    """
+    版本 since_ver 之后是否存在使区间 [start, end] 缓存失效的已提交变更：
+      - scope='config'（日历/计划重建）：任何缓存都作废；
+      - scope='range'（报价补改）：仅当被改交易日落在 [start, end] 内才作废；
+        只影响 end 之后换月的报价更正不失效，命中时走尾部最新价差。
+    走 change_log 主键/索引聚合，不读逐日原价；返回首个失效版本，无则 None。
+    """
+    row = conn.execute(
+        "SELECT MIN(ver) AS v FROM change_log "
+        "WHERE ver > ? AND ("
+        "  scope = 'config' OR (scope = 'range' AND change_day BETWEEN ? AND ?)"
+        ")",
+        (since_ver, start, end),
+    ).fetchone()
+    v = row["v"] if row else None
+    return v if v else None
+
+
+def _load_cache(conn: sqlite3.Connection, start: str, end: str
+                ) -> Optional[tuple[sqlite3.Row, list[sqlite3.Row]]]:
+    meta = conn.execute(
+        "SELECT * FROM range_cache WHERE cache_id = ? AND start_date = ? AND end_date = ?",
+        (CACHE_ID, start, end),
+    ).fetchone()
+    if meta is None:
+        return None
+    rows = list(conn.execute(
+        "SELECT * FROM range_cache_rows WHERE cache_id = ? ORDER BY day",
+        (CACHE_ID,),
+    ))
+    return meta, rows
+
+
+def _tail_state(conn: sqlite3.Connection, end: str, base: str) -> dict:
+    """
+    区间末日之后、基准日（含）以内的尾部换月窗口 (end_ord, base_ord] 现算。
+    读取的换月/索引记录数与区间天数无关、至多 O(log n)：
+      2 次 switch_date 唯一索引反向定位、1 次部分索引 LIMIT 1、
+      Fenwick 两个前缀和（各 O(log n) 个 bit_sums 主键记录）。
+    """
+    base_row = conn.execute(
+        "SELECT ord FROM rolls WHERE switch_date <= ? "
+        "ORDER BY switch_date DESC LIMIT 1",
+        (base,),
+    ).fetchone()
+    base_hi = base_row["ord"] if base_row else 0
+    end_ord = active_contract_ord(conn, end)
+    lo, hi = end_ord + 1, base_hi
+
+    miss = _first_missing_roll(conn, lo, hi)
+    miss_msg = _missing_roll_message(conn, miss) if miss is not None else None
+    tail_sum = None if miss is not None else range_delta_sum(conn, lo, hi)
+    return {"lo": lo, "hi": hi, "miss_message": miss_msg, "tail_sum": tail_sum}
+
+
+def _build_cache_payload(conn: sqlite3.Connection, end: str,
+                         days: list[str]) -> list[dict]:
+    """
+    缓存未命中：在调用方的只读快照内逐交易日构建稳定部分。
+    稳定窗口 = 切换日落在 (d, end] 的换月 ord in (ord_d, end_ord]，
+    其原价与价差在缓存有效期内不会变化（变化即失效）。
+    """
+    end_ord = active_contract_ord(conn, end)
+    payload: list[dict] = []
+    for day in days:
+        ord_ = active_contract_ord(conn, day)
+        contract = contract_by_ord(conn, ord_)
+        raw = get_price(conn, contract["contract_id"], day)
+        lo = ord_ + 1
+        item = {
+            "day": day, "contract": contract["code"], "ord": ord_,
+            "lo_ord": lo, "raw_price": raw, "stable_adj": None,
+            "status": "ok", "message": "",
+        }
+        if raw is None:
+            item["status"] = "missing_raw"
+            item["message"] = f"缺少原价：合约 {contract['code']} 在 {day} 的结算价待补"
+            payload.append(item)
+            continue
+        miss = _first_missing_roll(conn, lo, end_ord)
+        if miss is not None:
+            item["status"] = "missing_roll"
+            item["message"] = _missing_roll_message(conn, miss)
+        else:
+            item["stable_adj"] = range_delta_sum(conn, lo, end_ord)
+        payload.append(item)
+    return payload
+
+
+def _assemble_rows(payload: list[dict], tail: dict) -> list[dict]:
+    """
+    稳定部分（缓存行或刚构建的 payload）+ 当前快照的尾部换月状态 → 出数行。
+    构建与命中走同一组装逻辑，保证两条路径口径完全一致。
+    """
+    rows: list[dict] = []
+    for c in payload:
+        row = {
+            "date": c["day"], "contract": c["contract"],
+            "raw_price": c["raw_price"], "continuous": None,
+            "status": c["status"], "message": c["message"],
+        }
+        if c["status"] != "ok":
+            rows.append(row)  # 缺原价 / 稳定窗口缺换月报价：提示已随缓存固化
+            continue
+        if tail["miss_message"] is not None:
+            # 尾部（end 之后）缺价差：对区间内每一天都成立，按最早缺价换月提示
+            row["status"] = "missing_roll"
+            row["message"] = tail["miss_message"]
+        else:
+            adj = c["stable_adj"] + tail["tail_sum"]
+            row["adjustment"] = adj
+            row["continuous"] = c["raw_price"] + adj
+        rows.append(row)
+    return rows
+
+
+def _persist_cache(conn: sqlite3.Connection, start: str, end: str,
+                   built_ver: int, payload: list[dict]) -> bool:
+    """
+    发布单槽缓存（替换旧区间）。发布前复核当前版本：构建期间若已有新变更提交，
+    放弃发布，保证晚算完的旧缓存不会供新请求使用。失败不影响本次取数正确性。
+    """
+    try:
+        with write_tx(conn):
+            if current_ver(conn) != built_ver:
+                return False
+            conn.execute("DELETE FROM range_cache_rows")
+            conn.execute("DELETE FROM range_cache")
+            conn.execute(
+                "INSERT INTO range_cache(cache_id, start_date, end_date, built_ver) "
+                "VALUES (?, ?, ?, ?)",
+                (CACHE_ID, start, end, built_ver),
+            )
+            conn.executemany(
+                "INSERT INTO range_cache_rows(cache_id, day, contract, ord, lo_ord, "
+                " raw_price, stable_adj, status, message) "
+                "VALUES (1, :day, :contract, :ord, :lo_ord, :raw_price, "
+                "        :stable_adj, :status, :message)",
+                payload,
+            )
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _read_range_once(conn: sqlite3.Connection, start: str, end: str,
+                     base: str, days: list[str]) -> tuple[list[dict], str, int, list[dict]]:
+    """在一个只读快照事务内完成一次取数，返回 (rows, status, ver_now, payload)。"""
+    cache_status = "miss"
+    with snapshot(conn):
+        # 快照内首读即固定版本：缓存判定、缓存行、尾部价差都来自同一已提交状态
+        ver_now = current_ver(conn)
+        tail = _tail_state(conn, end, base)
+        found = _load_cache(conn, start, end)
+        payload: list[dict]
+        if found is not None:
+            meta, cached_rows = found
+            if (len(cached_rows) == len(days)
+                    and _invalidation_ver(conn, meta["built_ver"], start, end) is None):
+                payload = [dict(r) for r in cached_rows]
+                cache_status = "hit"
+        if cache_status != "hit":
+            payload = _build_cache_payload(conn, end, days)
+        rows = _assemble_rows(payload, tail)
+    return rows, cache_status, ver_now, payload
+
+
+def fetch_range_meta(conn: sqlite3.Connection, start: str, end: str,
+                     base: str) -> tuple[list[dict], dict]:
     """
     取 [start, end] 交易日的连续价，基准日 base（不早于 end）。
-    整个过程在一个只读快照事务中执行，看到的是同一已提交状态。
-    逐日查询：在用合约定位 O(log n)（唯一索引反向定位）、区间价差和 O(log n)（Fenwick）。
+    返回 (rows, meta)，meta 标注本次是缓存命中 hit、未命中 miss，
+    还是构建期间数据已变更而重取 miss_stale。
+    整次取数在一个只读快照事务内完成，只看到同一已提交状态（SQLite 读快照）。
+    命中时不读 prices 逐日原价，读取的换月/索引记录数至多 O(log n)（n=换月次数）。
     """
     for label, v in (("开始日", start), ("结束日", end), ("基准日", base)):
         if not valid_iso(v):
@@ -447,57 +692,30 @@ def fetch_range(conn: sqlite3.Connection, start: str, end: str,
     if base < end:
         raise AppError(f"基准日 {base} 不能早于结束日 {end}")
 
-    rows: list[dict] = []
+    # 日历与取数参数校验在任何快照之外完成
     with snapshot(conn):
-        # 所有读取均在同一只读快照内：整次取数只看到一个已提交状态
-        base_row = conn.execute(
-            "SELECT ord FROM rolls WHERE switch_date <= ? "
-            "ORDER BY switch_date DESC LIMIT 1",
-            (base,),
-        ).fetchone()
-        base_roll_hi = base_row["ord"] if base_row else 0
         days = [r["date"] for r in conn.execute(
             "SELECT date FROM calendar WHERE date BETWEEN ? AND ? ORDER BY date",
             (start, end),
         )]
-        if not days:
-            raise AppError(f"{start} 至 {end} 之间没有交易日")
+    if not days:
+        raise AppError(f"{start} 至 {end} 之间没有交易日")
 
-        for day in days:
-            ord_ = active_contract_ord(conn, day)
-            contract = contract_by_ord(conn, ord_)
-            raw = get_price(conn, contract["contract_id"], day)
+    # 至多重试一次：发布复核发现构建期间有新提交时，丢弃旧快照结果，
+    # 在新快照上按当前库重取——晚算完的旧缓存/旧结果都不会供新请求使用
+    rows, status, ver_now, payload = _read_range_once(conn, start, end, base, days)
+    if status == "miss" and not _persist_cache(conn, start, end, ver_now, payload):
+        # 构建期间数据已变更：旧结果作废，按当前库重新取数并再试一次发布
+        rows, _, ver_now, payload = _read_range_once(conn, start, end, base, days)
+        _persist_cache(conn, start, end, ver_now, payload)
+        status = "miss_stale"  # 本次返回的已是当前库状态的重取结果
+    return rows, {"cache": status, "built_ver": ver_now}
 
-            # 该日之后至基准日（含）的换月：switch_date in (day, base] → ord in (ord_, base_roll_hi]
-            lo, hi = ord_ + 1, base_roll_hi
-            miss_roll = _first_missing_roll(conn, lo, hi)
 
-            row = {
-                "date": day,
-                "contract": contract["code"],
-                "raw_price": raw,
-                "continuous": None,
-                "status": "ok",
-                "message": "",
-            }
-            if raw is None:
-                row["status"] = "missing_raw"
-                row["message"] = f"缺少原价：合约 {contract['code']} 在 {day} 的结算价待补"
-            elif miss_roll is not None:
-                row["status"] = "missing_roll"
-                miss_cs = _missing_quote_contracts(conn, miss_roll)
-                names = "、".join(
-                    f"{c['code']}({miss_roll['pre_date']})" for c in miss_cs
-                ) or "价差所需报价"
-                row["message"] = (
-                    f"换月 {miss_roll['old_code']} → {miss_roll['new_code']} "
-                    f"（切换日 {miss_roll['switch_date']}）缺价差，待补报价：{names}"
-                )
-            else:
-                adj = range_delta_sum(conn, lo, hi)
-                row["continuous"] = raw + adj
-                row["adjustment"] = adj
-            rows.append(row)
+def fetch_range(conn: sqlite3.Connection, start: str, end: str,
+                base: str) -> list[dict]:
+    """兼容旧接口：只返回逐日行（meta 由 fetch_range_meta 提供）。"""
+    rows, _ = fetch_range_meta(conn, start, end, base)
     return rows
 
 

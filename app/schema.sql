@@ -45,6 +45,43 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (contract_id, date)
 ) WITHOUT ROWID;
 
+-- 连续价取数缓存（网页查询与 CSV 下载共用，单槽：最近一个查价区间）
+-- 缓存只存“区间末日及之前”的数据状态；末日之后的换月价差异动不使缓存失效，
+-- 命中时按本次基准日读取最新 roll/bit_sums（O(log n)）出数。
+CREATE TABLE IF NOT EXISTS range_cache (
+    cache_id     INTEGER PRIMARY KEY CHECK (cache_id = 1),
+    start_date   TEXT NOT NULL,
+    end_date     TEXT NOT NULL,
+    -- 构建该缓存时已看到的最新变更版本；命中要求版本之后没有影响本区间的变更
+    built_ver    INTEGER NOT NULL,
+    built_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS range_cache_rows (
+    cache_id     INTEGER NOT NULL REFERENCES range_cache(cache_id) ON DELETE CASCADE,
+    day          TEXT NOT NULL,
+    contract     TEXT NOT NULL,          -- 构建时在用合约代码（计划变更必作废缓存）
+    ord          INTEGER NOT NULL,       -- 当日在用合约 ord
+    lo_ord       INTEGER NOT NULL,       -- 该日之后首个换月 ord = ord + 1
+    raw_price    INTEGER,                -- 当日原价，缺价为 NULL
+    stable_adj   INTEGER,                -- 切换日 <= 区间末日部分的价差和（稳定窗口）
+    status       TEXT NOT NULL,          -- ok / missing_raw / missing_roll
+    message      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (cache_id, day)
+) WITHOUT ROWID;
+
+-- 数据变更日志：每条写事务提交一条，版本严格递增。
+-- scope='range' 仅影响含该交易日的查价区间；scope='config' 使全部缓存作废
+-- （日历/计划变更后取数必须与按当前库直接查询一致）。
+CREATE TABLE IF NOT EXISTS change_log (
+    ver          INTEGER PRIMARY KEY,
+    scope        TEXT NOT NULL CHECK (scope IN ('range', 'config')),
+    change_day   TEXT,                   -- scope='range' 时被改报价所在交易日
+    reason       TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_change_day ON change_log(change_day);
+
 CREATE INDEX IF NOT EXISTS idx_rolls_switch  ON rolls(switch_date);
 CREATE INDEX IF NOT EXISTS idx_rolls_predate ON rolls(pre_date);
 -- 部分索引：快速定位区间内最早缺价差的换月

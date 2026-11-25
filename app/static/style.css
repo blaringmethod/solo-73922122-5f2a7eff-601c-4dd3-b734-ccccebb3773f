@@ -43,6 +43,9 @@ button:hover { opacity: .88; }
 .card p { margin: 0; font-size: 24px; font-weight: 600; }
 .card small { color: #98a2ad; }
 .hint { color: #616e7c; font-size: 13px; }
+.cache-badge { background: #eef4ff; border: 1px solid #b9cef5; border-radius: 6px;
+  padding: 8px 12px; }
+.cache-badge strong { color: #1f3a5f; }
 .flash-wrap { margin-bottom: 16px; }
 .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: 14px; }
 .flash.ok { background: #e6f6ec; border: 1px solid #7cc79a; color: #1c6b3a; }

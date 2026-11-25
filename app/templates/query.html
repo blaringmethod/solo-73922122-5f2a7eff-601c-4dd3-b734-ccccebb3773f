@@ -14,6 +14,15 @@
 
 {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
 
+{% if cache %}
+<p class="hint cache-badge">
+  本次取数：
+  {% if cache == 'hit' %}<strong>命中查价区间缓存</strong>（未重读逐日原价，尾部换月按最新价差现算）
+  {% elif cache == 'miss_stale' %}缓存构建期间数据已变更，已按当前库重新取数（旧缓存未启用）
+  {% else %}<strong>缓存未命中</strong>（已构建本区间缓存，网页与 CSV 后续共用）{% endif %}
+</p>
+{% endif %}
+
 {% if rows %}
 <div class="actions">
   <a class="button" href="{{ url_for('download', start=start, end=end, base=base) }}">下载 CSV</a>

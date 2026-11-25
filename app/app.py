@@ -130,8 +130,13 @@ def create_app() -> Flask:
         )
 
     # ------------------------------------------------------------------ #
-    # 取数：连续价查询 + CSV 下载
+    # 取数：连续价查询 + CSV 下载（共用同一份查价区间缓存）
     # ------------------------------------------------------------------ #
+    def _do_fetch(conn, start: str, end: str, base: str):
+        """网页与下载的唯一取数入口：同口径、同缓存、同一已提交快照。"""
+        rows, meta = db.fetch_range_meta(conn, start, end, base)
+        return rows, meta
+
     @app.route("/query", methods=["GET"])
     def query_view():
         conn = get_conn()
@@ -140,14 +145,21 @@ def create_app() -> Flask:
         base = request.args.get("base", "").strip()
         rows = None
         err = None
+        cache = None
         if start or end or base:
             try:
-                rows = db.fetch_range(conn, start, end, base)
+                rows, meta = _do_fetch(conn, start, end, base)
+                cache = meta["cache"]
             except db.AppError as e:
                 err = str(e)
-        return render_template(
-            "query.html", start=start, end=end, base=base, rows=rows, err=err
+        resp = render_template(
+            "query.html", start=start, end=end, base=base, rows=rows,
+            err=err, cache=cache,
         )
+        if cache is not None:
+            # 便于自测与排查：响应头标注本次取数是否命中缓存
+            return Response(resp, headers={"X-Cache-Status": cache})
+        return resp
 
     @app.route("/download")
     def download():
@@ -159,7 +171,7 @@ def create_app() -> Flask:
             flash("下载前请先填写开始日、结束日和基准日", "err")
             return redirect(url_for("query_view"))
         try:
-            rows = db.fetch_range(conn, start, end, base)
+            rows, meta = _do_fetch(conn, start, end, base)
         except db.AppError as e:
             flash(str(e), "err")
             return redirect(url_for("query_view"))
@@ -168,7 +180,10 @@ def create_app() -> Flask:
         return Response(
             "﻿" + csv_text,  # UTF-8 BOM，Excel 直接打开不乱码
             mimetype="text/csv; charset=utf-8",
-            headers={"Content-Disposition": f"attachment; filename={fname}"},
+            headers={
+                "Content-Disposition": f"attachment; filename={fname}",
+                "X-Cache-Status": meta["cache"],
+            },
         )
 
     return app

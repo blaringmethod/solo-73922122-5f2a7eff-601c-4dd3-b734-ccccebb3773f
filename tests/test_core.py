@@ -1,9 +1,11 @@
 """
 核心逻辑测试：
-  连续价口径、缺价提示、改价联动、原子提交、快照隔离、Fenwick 对数复杂度、CSV、Web 冒烟。
+  连续价口径、缺价提示、改价联动、原子提交、快照隔离、Fenwick 对数复杂度、CSV、Web 冒烟、
+  查价区间缓存（命中/失效/版本作废/对数级读取）。
 运行：PYTHONPATH=. python -m unittest discover -s tests -v
 """
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -276,6 +278,316 @@ class TestPlanValidation(unittest.TestCase):
         db.upsert_price(self.conn, cid, "2026-01-05", 100)
         with self.assertRaises(db.AppError):
             db.setup_plan(self.conn, "C0", [("2026-01-09", "X1")])
+
+
+class _CountingConn:
+    """
+    连接代理：统计 SELECT 语句对各类表的访问次数。
+    本系统中 rolls/bit_sums 的读取均为索引定位/LIMIT 1/主键点查（每次至多 1 行），
+    因此语句数即换月及索引记录读取数的上界，可用来证明 O(log n) 且与区间天数无关。
+    """
+
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "counters", {
+            "prices_reads": 0, "roll_index_reads": 0,
+            "cache_reads": 0, "other_reads": 0, "writes": 0,
+        })
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        if name in ("_real", "counters"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._real, name, value)
+
+    def execute(self, sql, params=()):
+        s = sql.lstrip().upper()
+        if s.startswith("SELECT"):
+            if re.search(r"\b(?:FROM|JOIN)\s+PRICES\b", sql, re.I):
+                self.counters["prices_reads"] += 1
+            elif re.search(r"\b(?:FROM|JOIN)\s+(ROLLS|BIT_SUMS)\b", sql, re.I):
+                self.counters["roll_index_reads"] += 1
+            elif re.search(r"\b(?:FROM|JOIN)\s+(RANGE_CACHE|RANGE_CACHE_ROWS|CHANGE_LOG)\b",
+                           sql, re.I):
+                self.counters["cache_reads"] += 1
+            else:
+                self.counters["other_reads"] += 1
+        else:
+            self.counters["writes"] += 1
+        return self._real.execute(sql, params)
+
+    def close(self):
+        return self._real.close()
+
+
+class TestRangeCache(BaseCase):
+    def fetch_meta(self, start, end, base):
+        return db.fetch_range_meta(self.conn, start, end, base)
+
+    def test_first_miss_then_hit_and_equal(self):
+        r1, m1 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m1["cache"], "miss")
+        r2, m2 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m2["cache"], "hit")
+        self.assertEqual(r1, r2)  # 命中路径与构建路径出数完全一致
+
+    def test_switch_base_day_keeps_hit(self):
+        # 同一查价区间（start/end 不变），仅换基准日
+        _, m1 = self.fetch_meta("2026-01-05", "2026-01-09", "2026-01-09")
+        self.assertEqual(m1["cache"], "miss")
+        rows, m2 = self.fetch_meta("2026-01-05", "2026-01-09", "2026-01-13")
+        self.assertEqual(m2["cache"], "hit")
+        got = {r["date"]: r["continuous"] for r in rows}
+        # 基准日 01-13：roll2 计入 → 首日 = 1000+10+25
+        self.assertEqual(got["2026-01-05"], 1035)
+        # 再换回基准日 01-09：roll2 不计入 → 首日 = 1000+10
+        rows, m3 = self.fetch_meta("2026-01-05", "2026-01-09", "2026-01-09")
+        self.assertEqual(m3["cache"], "hit")
+        self.assertEqual(rows[0]["continuous"], 1010)
+
+    def test_web_and_csv_share_one_cache(self):
+        os.environ["CONT_DB_PATH"] = self.db_path
+        from app.app import create_app
+        app = create_app()
+        app.config["TESTING"] = True
+        client = app.test_client()
+        q = "/query?start=2026-01-05&end=2026-01-13&base=2026-01-13"
+        self.assertEqual(client.get(q).headers["X-Cache-Status"], "miss")
+        # 网页再查与 CSV 下载都命中同一个缓存
+        self.assertEqual(client.get(q).headers["X-Cache-Status"], "hit")
+        dl = "/download?start=2026-01-05&end=2026-01-13&base=2026-01-13"
+        self.assertEqual(client.get(dl).headers["X-Cache-Status"], "hit")
+
+    def test_correction_only_affecting_roll_after_end_keeps_hit(self):
+        # 区间末日 01-08；roll2 参考日 01-09 在末日之后
+        _, m1 = self.fetch_meta("2026-01-05", "2026-01-08", "2026-01-13")
+        self.assertEqual(m1["cache"], "miss")
+        before = {r["date"]: r["continuous"] for r in
+                  self.fetch_meta("2026-01-05", "2026-01-08", "2026-01-13")[0]}
+        self.assertEqual(before["2026-01-05"], 1035)  # 1000 + 10 + 25
+
+        # 改 01-09 旧合约 C1 的价：1050 → 1060，只联动 roll2（pre_date=01-09 > end）
+        cid = next(r["contract_id"] for r in db.list_contracts(self.conn)
+                   if r["code"] == "C1")
+        db.upsert_price(self.conn, cid, "2026-01-09", 1060)
+
+        rows, m2 = self.fetch_meta("2026-01-05", "2026-01-08", "2026-01-13")
+        self.assertEqual(m2["cache"], "hit")  # 补改不影响区间内数据，缓存仍命中
+        # 新 delta2 = 1075 - 1060 = 15；按本次基准日与最新价差出数
+        self.assertEqual(rows[0]["continuous"], 1000 + 10 + 15)
+        # 区间内 01-08 当天原价未受影响
+        self.assertEqual(next(r for r in rows if r["date"] == "2026-01-08")
+                         ["continuous"], 1040 + 15)
+
+    def test_correction_inside_range_invalidates_cache(self):
+        self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        cid = next(r["contract_id"] for r in db.list_contracts(self.conn)
+                   if r["code"] == "C1")
+        db.upsert_price(self.conn, cid, "2026-01-07", 1035)  # 1030 → 1035
+        rows, m = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m["cache"], "miss")          # 区间内报价更正 → 作废重建
+        self.assertEqual(rows[0]["continuous"], 1000 + 15 + 25)
+        rows2, m2 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m2["cache"], "hit")          # 重建后再次命中
+        self.assertEqual(rows2, rows)
+
+    def test_missing_price_hints_identical_on_hit(self):
+        # 缺原价场景
+        cid = next(r["contract_id"] for r in db.list_contracts(self.conn)
+                   if r["code"] == "C0")
+        self.conn.execute("DELETE FROM prices WHERE contract_id=? AND date='2026-01-06'",
+                          (cid,))
+        r1, m1 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        r2, m2 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m1["cache"], "miss")
+        self.assertEqual(m2["cache"], "hit")
+        self.assertEqual(r1, r2)  # 缺价留空与提示规则命中时保持一致
+        row = next(r for r in r2 if r["date"] == "2026-01-06")
+        self.assertEqual(row["status"], "missing_raw")
+        self.assertIn("C0", row["message"])
+
+    def test_missing_roll_hint_identical_on_hit(self):
+        cid = next(r["contract_id"] for r in db.list_contracts(self.conn)
+                   if r["code"] == "C1")
+        self.conn.execute("DELETE FROM prices WHERE contract_id=? AND date='2026-01-07'",
+                          (cid,))
+        with db.write_tx(self.conn):
+            db._recompute_roll_delta(self.conn, 1)
+        r1, _ = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        r2, m2 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m2["cache"], "hit")
+        self.assertEqual(r1, r2)
+        self.assertIn("C0 → C1", r2[0]["message"])
+        self.assertIn("C1(2026-01-07)", r2[0]["message"])
+
+    def test_calendar_change_invalidates_cache(self):
+        self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        db.replace_calendar(self.conn, CAL)  # 内容相同也会登记 config 变更
+        _, m = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m["cache"], "miss")
+
+    def test_config_scope_change_always_invalidates(self):
+        self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        with db.write_tx(self.conn):
+            db._record_change(self.conn, "config", "test-config-change")
+        _, m = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m["cache"], "miss")
+
+    def test_stale_cache_built_at_old_version_not_served(self):
+        # 先建缓存，再手工把缓存标记为更旧的版本（模拟晚算完的旧缓存）
+        self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.conn.execute("UPDATE range_cache SET built_ver = 0 WHERE cache_id = 1")
+        rows, m = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m["cache"], "miss")          # 旧缓存不供新请求
+        rows2, m2 = self.fetch_meta("2026-01-05", "2026-01-13", "2026-01-13")
+        self.assertEqual(m2["cache"], "hit")
+        self.assertEqual(rows, rows2)
+
+    def test_persist_rejects_when_version_moved_during_build(self):
+        payload = [{
+            "day": "2026-01-05", "contract": "C0", "ord": 0, "lo_ord": 1,
+            "raw_price": 1000, "stable_adj": 0, "status": "ok", "message": "",
+        }]
+        ver = db.current_ver(self.conn)
+        # 构建期间行情员补改了一笔报价（版本前进）
+        cid = next(r["contract_id"] for r in db.list_contracts(self.conn)
+                   if r["code"] == "C0")
+        db.upsert_price(self.conn, cid, "2026-01-05", 1111)
+        published = db._persist_cache(self.conn, "2026-01-05", "2026-01-05",
+                                      ver, payload)
+        self.assertFalse(published)  # 版本复核失败，放弃发布旧缓存
+        self.assertIsNone(
+            self.conn.execute("SELECT * FROM range_cache WHERE cache_id=1").fetchone())
+
+    def test_fetch_retries_with_fresh_snapshot_when_build_goes_stale(self):
+        # 端到端模拟：读快照固定 → 期间他人提交更正 → 发布复核失败 → 自动重取
+        reader = db.connect(self.db_path)
+        try:
+            reader.execute("BEGIN")
+            ver = db.current_ver(reader)
+            days = [r["date"] for r in reader.execute(
+                "SELECT date FROM calendar WHERE date BETWEEN ? AND ? ORDER BY date",
+                ("2026-01-05", "2026-01-13"))]
+            stale_payload = db._build_cache_payload(reader, "2026-01-13", days)
+            other = db.connect(self.db_path)
+            cid = next(r["contract_id"] for r in db.list_contracts(other)
+                       if r["code"] == "C1")
+            db.upsert_price(other, cid, "2026-01-07", 1035)  # delta1: 10 → 15
+            other.close()
+            reader.execute("COMMIT")
+            # 直接发布旧 payload 必被拒
+            self.assertFalse(db._persist_cache(reader, "2026-01-05", "2026-01-13",
+                                               ver, stale_payload))
+        finally:
+            reader.close()
+        # 正常取数：内部重取后返回的是更正后的当前库结果
+        rows, meta = db.fetch_range_meta(self.conn, "2026-01-05",
+                                         "2026-01-13", "2026-01-13")
+        self.assertIn(meta["cache"], ("miss", "miss_stale"))
+        self.assertEqual(rows[0]["continuous"], 1000 + 15 + 25)
+        # 再查必命中新缓存
+        rows2, meta2 = db.fetch_range_meta(self.conn, "2026-01-05",
+                                           "2026-01-13", "2026-01-13")
+        self.assertEqual(meta2["cache"], "hit")
+        self.assertEqual(rows2, rows)
+
+    def test_hit_does_not_read_prices_and_roll_reads_are_log_n(self):
+        # 64 次换月，取数只覆盖前半段，基准日放到最后 → 命中时尾部含大量换月
+        n = 64
+        tmp = tempfile.TemporaryDirectory()
+        big_path = os.path.join(tmp.name, "big.db")
+        big = db.connect(big_path)
+        db.init_db(big)
+        start0 = date(2026, 1, 5)
+        days = [(start0 + timedelta(days=i)).isoformat()
+                for i in range(2 + (n + 1) * 2)]
+        db.replace_calendar(big, days)
+        switches = [(days[2 * k + 1], f"K{k+1}") for k in range(n)]
+        db.setup_plan(big, "K0", switches)
+        cid = {r["code"]: r["contract_id"] for r in db.list_contracts(big)}
+        for k in range(n + 1):
+            for di, day in enumerate(days):
+                db.upsert_price(big, cid[f"K{k}"], day, 100 + k * 7 + di)
+
+        q_start, q_end, q_base = days[2], days[40], days[-1]
+        # 首次未命中：构建缓存（会逐日读 prices）
+        r_miss, m_miss = db.fetch_range_meta(big, q_start, q_end, q_base)
+        self.assertEqual(m_miss["cache"], "miss")
+
+        # 另开连接做计数代理，读已提交的缓存
+        counter = _CountingConn(db.connect(big_path))
+        try:
+            r_hit, m_hit = db.fetch_range_meta(counter, q_start, q_end, q_base)
+            self.assertEqual(m_hit["cache"], "hit")
+            self.assertEqual(r_hit, r_miss)
+            # 命中时完全不重读逐日原价
+            self.assertEqual(counter.counters["prices_reads"], 0)
+            # 换月/索引记录读取数只随换月次数对数增长，与区间天数无关：
+            # 2 次切换日索引定位 + 1 次缺价部分索引 + 两个 Fenwick 前缀和（各 ≤ bit_length）
+            bound = 3 + 2 * n.bit_length()
+            self.assertLessEqual(counter.counters["roll_index_reads"], bound)
+            # 缓存行数 = 区间交易日数（缓存自身数据，不计入换月/索引读取）
+            n_cached = counter.execute(
+                "SELECT COUNT(*) AS c FROM range_cache_rows").fetchone()["c"]
+            self.assertEqual(n_cached, len(r_hit))
+        finally:
+            counter.close()
+            big.close()
+            tmp.cleanup()
+
+    def test_build_then_concurrent_correction_serves_only_fresh_state(self):
+        # 模拟取数进行到一半时行情员补改报价：
+        # 取数连接的读快照固定在改价前，发布时复核到版本已前进 → 放弃发布；
+        # 随后的新请求不命中旧缓存，按当前库出数。
+        reader = db.connect(self.db_path)
+        try:
+            reader.execute("BEGIN")  # 读快照固定在改价前
+            ver = db.current_ver(reader)
+            days = [r["date"] for r in reader.execute(
+                "SELECT date FROM calendar WHERE date BETWEEN ? AND ? ORDER BY date",
+                ("2026-01-05", "2026-01-13"))]
+            payload = db._build_cache_payload(reader, "2026-01-13", days)
+            # 另一连接在取数期间提交更正（区间内报价）
+            other = db.connect(self.db_path)
+            cid = next(r["contract_id"] for r in db.list_contracts(other)
+                       if r["code"] == "C1")
+            db.upsert_price(other, cid, "2026-01-07", 1035)
+            other.close()
+            reader.execute("COMMIT")
+
+            published = db._persist_cache(reader, "2026-01-05", "2026-01-13",
+                                          ver, payload)
+            self.assertFalse(published)  # 晚算完的旧缓存不得发布
+            rows, m = db.fetch_range_meta(self.conn, "2026-01-05",
+                                          "2026-01-13", "2026-01-13")
+            self.assertEqual(m["cache"], "miss")      # 新请求按当前库重新取数
+            self.assertEqual(rows[0]["continuous"], 1000 + 15 + 25)
+        finally:
+            reader.close()
+
+    def test_hit_matches_brute_force_after_corrections(self):
+        # 交错补改后，命中结果必须与按当前库暴力重算一致
+        self.fetch_meta("2026-01-05", "2026-01-08", "2026-01-13")  # 建缓存
+        c1 = next(r["contract_id"] for r in db.list_contracts(self.conn)
+                  if r["code"] == "C1")
+        db.upsert_price(self.conn, c1, "2026-01-09", 1060)   # 仅影响 end 之后换月 → 仍命中
+        rows, m = self.fetch_meta("2026-01-05", "2026-01-08", "2026-01-13")
+        self.assertEqual(m["cache"], "hit")
+
+        rolls = db.list_rolls(self.conn)
+        for r in rows:
+            day = r["date"]
+            ord_ = db.active_contract_ord(self.conn, day)
+            code = db.contract_by_ord(self.conn, ord_)["code"]
+            cidv = next(c["contract_id"] for c in db.list_contracts(self.conn)
+                        if c["code"] == code)
+            raw = db.get_price(self.conn, cidv, day)
+            s = sum(rl["delta"] for rl in rolls
+                    if day < rl["switch_date"] <= "2026-01-13")
+            self.assertEqual(r["continuous"], raw + s, msg=day)
 
 
 class TestCSVAndWeb(BaseCase):
